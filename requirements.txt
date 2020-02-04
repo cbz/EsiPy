@@ -7,8 +7,10 @@ mock
 future
 python-memcached
 diskcache
-pyswagger>=0.8.31
+pyswagger>=0.8.39
 requests
 six
 redis
 pylint
+pytz
+python-jose>=3.0,<4

@@ -3,18 +3,24 @@
 from __future__ import absolute_import
 
 from .mock import _all_auth_mock_
+from .mock import eve_status
+from .mock import eve_status_noetag
+from .mock import make_expire_time_str
+from .mock import post_universe_id
 from .mock import public_incursion
+from .mock import public_incursion_expired
 from .mock import public_incursion_no_expires
 from .mock import public_incursion_no_expires_second
 from .mock import public_incursion_server_error
 from .mock import public_incursion_warning
-from .mock import public_incursion_expired
+from .mock import non_json_error
 from esipy import App
 from esipy import EsiClient
 from esipy import EsiSecurity
 from esipy.cache import BaseCache
 from esipy.cache import DictCache
 from esipy.cache import DummyCache
+from esipy.exceptions import APIException
 
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError
@@ -25,6 +31,7 @@ import six
 import time
 import unittest
 import warnings
+import json
 
 import logging
 # set pyswagger logger to error, as it displays too much thing for test needs
@@ -42,21 +49,29 @@ class TestEsiPy(unittest.TestCase):
     BASIC_TOKEN = six.u('Zm9vOmJhcg==')
     SECURITY_NAME = 'evesso'
 
+    RSC_SSO_ENDPOINTS = "test/resources/oauth-authorization-server.json"
+    RSC_JWKS = "test/resources/jwks.json"
+
     @mock.patch('six.moves.urllib.request.urlopen')
     def setUp(self, urlopen_mock):
         # I hate those mock... thx urlopen instead of requests...
         urlopen_mock.return_value = open('test/resources/swagger.json')
+        warnings.simplefilter('ignore')
 
         self.app = App.create(
-            'https://esi.tech.ccp.is/latest/swagger.json'
+            'https://esi.evetech.net/latest/swagger.json'
         )
 
-        self.security = EsiSecurity(
-            app=self.app,
-            redirect_uri=TestEsiPy.CALLBACK_URI,
-            client_id=TestEsiPy.CLIENT_ID,
-            secret_key=TestEsiPy.SECRET_KEY,
-        )
+        with open(TestEsiPy.RSC_SSO_ENDPOINTS, 'r') as sso_endpoints:
+            with open(TestEsiPy.RSC_JWKS, "r") as jwks:
+                self.security = EsiSecurity(
+                    app=self.app,
+                    redirect_uri=TestEsiPy.CALLBACK_URI,
+                    client_id=TestEsiPy.CLIENT_ID,
+                    secret_key=TestEsiPy.SECRET_KEY,
+                    sso_endpoints=json.load(sso_endpoints),
+                    jwks_key=json.load(jwks)
+                )
 
         self.cache = DictCache()
         self.client = EsiClient(self.security, cache=self.cache)
@@ -165,12 +180,16 @@ class TestEsiPy(unittest.TestCase):
             self.assertEqual(incursions.data[0].state, 'mobilizing')
 
     def test_client_warning_header(self):
+        # deprecated warning
+        warnings.simplefilter('error')
         with httmock.HTTMock(public_incursion_warning):
-            warnings.simplefilter('error')
             incursion_operation = self.app.op['get_incursions']
 
             with self.assertRaises(UserWarning):
                 self.client_no_auth.request(incursion_operation())
+
+            with self.assertRaises(UserWarning):
+                self.client_no_auth.head(incursion_operation())
 
     def test_client_raw_body_only(self):
         client = EsiClient(raw_body_only=True)
@@ -247,6 +266,22 @@ class TestEsiPy(unittest.TestCase):
         self.assertEqual(incursions.status, 500)
         self.assertEqual(send_function.count, 5)
 
+    def test_esipy_raise_on_error(self):
+        operation = self.app.op['get_incursions']()
+
+        with httmock.HTTMock(public_incursion_server_error):
+            # try with retries
+            with self.assertRaises(APIException):
+                self.client_no_auth.request(operation, raise_on_error=True)
+
+            # try without retries
+            with self.assertRaises(APIException):
+                self.client.request(operation, raise_on_error=True)
+
+            # try with head
+            with self.assertRaises(APIException):
+                self.client_no_auth.head(operation, raise_on_error=True)
+
     def test_esipy_expired_response(self):
         operation = self.app.op['get_incursions']
 
@@ -260,3 +295,93 @@ class TestEsiPy(unittest.TestCase):
             warnings.simplefilter('ignore')
             incursions = self.client_no_auth.request(operation())
             self.assertEquals(incursions.status, 200)
+
+    def test_esipy_uncached_method(self):
+        operation = self.app.op['post_universe_ids'](names=['Foo'])
+
+        self.assertEqual(self.cache._dict, {})
+        with httmock.HTTMock(post_universe_id):
+            res = self.client.request(operation)
+            self.assertEqual(res.data.characters[0].id, 123456789)
+
+        self.assertEqual(self.cache._dict, {})
+
+    def test_esipy_head_request(self):
+        operation = self.app.op['get_incursions']()
+
+        with httmock.HTTMock(public_incursion):
+            res = self.client.head(operation)
+            self.assertIsNone(res.data)
+            self.assertIn('Expires', res.header)
+
+    def test_esipy_expired_header_etag(self):
+        @httmock.all_requests
+        def check_etag(url, request):
+            self.assertEqual(
+                request.headers.get('If-None-Match'),
+                '"esipy_test_etag_status"'
+            )
+            return httmock.response(
+                headers={'Etag': '"esipy_test_etag_status"',
+                         'expires': make_expire_time_str(),
+                         'date': make_expire_time_str()},
+                status_code=304)
+
+        operation = self.app.op['get_status']()
+
+        with httmock.HTTMock(eve_status):
+            self.assertEqual(self.cache._dict, {})
+            res = self.client.request(operation)
+            self.assertNotEqual(self.cache._dict, {})
+            self.assertEqual(res.data.server_version, "1313143")
+
+        time.sleep(2)
+
+        with httmock.HTTMock(check_etag):
+            res = self.client.request(operation)
+            self.assertEqual(res.data.server_version, "1313143")
+
+    def test_esipy_expired_header_noetag(self):
+        def check_etag(url, request):
+            self.assertNotIn('If-None-Match', request.headers)
+            return httmock.response(
+                status_code=200,
+                content={
+                    "players": 29597,
+                    "server_version": "1313143",
+                    "start_time": "2018-05-20T11:04:30Z"
+                }
+            )
+
+        operation = self.app.op['get_status']()
+
+        with httmock.HTTMock(eve_status_noetag):
+            res = self.client.request(operation)
+            self.assertEqual(res.data.server_version, "1313143")
+
+        time.sleep(2)
+
+        with httmock.HTTMock(check_etag):
+            res = self.client.request(operation)
+            self.assertEqual(res.data.server_version, "1313143")
+
+    def test_esipy_non_json_response(self):
+        operation = self.app.op['get_status']()
+        with httmock.HTTMock(non_json_error):
+            try:
+                self.client.request(operation)
+            except APIException as exc:
+                self.assertEqual(exc.status_code, 502)
+                self.assertEqual(
+                    exc.response,
+                    six.b('<html><body>Some HTML Errors</body></html>')
+                )
+
+            try:
+                self.client_no_auth.request(operation)
+            except APIException as exc:
+                self.assertEqual(exc.status_code, 502)
+                self.assertEqual(
+                    exc.response,
+                    six.b('<html><body>Some HTML Errors</body></html>')
+                )
